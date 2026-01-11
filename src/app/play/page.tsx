@@ -469,6 +469,9 @@ function PlayPageClient() {
   const [doubanAka, setDoubanAka] = useState<string[]>([]);
   const [doubanYear, setDoubanYear] = useState<string>(''); // 从 pubdate 提取的年份
 
+  // 纠错后的描述信息（用于显示，不触发 detail 更新）
+  const [correctedDesc, setCorrectedDesc] = useState<string>('');
+
   // 当前源和ID - source 直接存储完整格式（如 'emby_wumei' 或 'emby'）
   const [currentSource, setCurrentSource] = useState(searchParams.get('source') || '');
   const [currentId, setCurrentId] = useState(searchParams.get('id') || '');
@@ -2360,8 +2363,9 @@ function PlayPageClient() {
           throw new Error('获取视频详情失败');
         }
         const detailData = (await detailResponse.json()) as SearchResult;
-        setAvailableSources([detailData]);
-        return [detailData];
+        const sourcesWithCorrections = applyCorrectionsToSources([detailData]);
+        setAvailableSources(sourcesWithCorrections);
+        return sourcesWithCorrections;
       } catch (err) {
         console.error('获取视频详情失败:', err);
         return [];
@@ -2444,7 +2448,7 @@ function PlayPageClient() {
                     : true)
               );
 
-              setAvailableSources(results);
+              setAvailableSources(applyCorrectionsToSources(results));
               return results;
             }
           } catch (error) {
@@ -2478,7 +2482,7 @@ function PlayPageClient() {
               ? getType(result) === searchType
               : true)
         );
-        setAvailableSources(results);
+        setAvailableSources(applyCorrectionsToSources(results));
         return results;
       } catch (err) {
         setSourceSearchError(err instanceof Error ? err.message : '搜索失败');
@@ -2531,7 +2535,7 @@ function PlayPageClient() {
               allSources.push(source);
             }
           });
-          setAvailableSources(allSources);
+          setAvailableSources(applyCorrectionsToSources(allSources));
           setBackgroundSourcesLoading(false);
         }).catch((err) => {
           console.error('异步获取其他源失败:', err);
@@ -2636,6 +2640,10 @@ function PlayPageClient() {
         if (correction) {
           console.log('发现小雅源纠错信息，正在应用...', correction);
           detailData = applyCorrection(detailData, correction);
+          // 同时设置纠错后的描述
+          if (correction.overview) {
+            setCorrectedDesc(correction.overview);
+          }
         }
       }
 
@@ -2935,9 +2943,33 @@ function PlayPageClient() {
       newUrl.searchParams.set('title', newDetail.title || newTitle);
       window.history.replaceState({}, '', newUrl.toString());
 
-      setVideoTitle(newDetail.title || newTitle);
+      // 如果是小雅源，检查并应用纠错信息
+      let finalTitle = newDetail.title || newTitle;
+      let finalCover = newDetail.poster;
+      let finalDesc = '';
+
+      if (newDetail.source === 'xiaoya') {
+        const correction = getXiaoyaCorrection(newDetail.source, newDetail.id);
+        if (correction) {
+          console.log('换源到小雅源，发现纠错信息，正在应用...', correction);
+          if (correction.title) {
+            finalTitle = correction.title;
+          }
+          if (correction.posterPath) {
+            finalCover = getTMDBImageUrl(correction.posterPath);
+          }
+          if (correction.overview) {
+            finalDesc = correction.overview;
+          }
+          // 应用纠错信息到 newDetail
+          newDetail = applyCorrection(newDetail, correction);
+        }
+      }
+
+      setVideoTitle(finalTitle);
       setVideoYear(newDetail.year);
-      setVideoCover(newDetail.poster);
+      setVideoCover(finalCover);
+      setCorrectedDesc(finalDesc);
       setVideoDoubanId(newDetail.douban_id || 0);
       // newSource 已经是完整格式
       setCurrentSource(newSource);
@@ -3928,21 +3960,33 @@ function PlayPageClient() {
     if (correction) {
       console.log('应用纠错信息:', correction);
 
-      // 应用纠错信息到 detail
-      const updatedDetail = applyCorrection(detail, correction);
-
-      // 更新所有相关状态
-      setDetail(updatedDetail);
-      setVideoTitle(updatedDetail.title);
-      setVideoCover(updatedDetail.poster);
-      if (updatedDetail.douban_id) {
-        setVideoDoubanId(updatedDetail.douban_id);
+      // 只更新显示相关的状态，不更新 detail（避免触发其他 useEffect）
+      if (correction.title) {
+        setVideoTitle(correction.title);
+      }
+      if (correction.posterPath) {
+        const fullPosterUrl = getTMDBImageUrl(correction.posterPath);
+        setVideoCover(fullPosterUrl);
+      }
+      if (correction.overview) {
+        setCorrectedDesc(correction.overview);
+      }
+      if (correction.doubanId) {
+        const doubanIdNum = typeof correction.doubanId === 'string'
+          ? parseInt(correction.doubanId, 10)
+          : correction.doubanId;
+        setVideoDoubanId(doubanIdNum);
       }
 
-      // 更新 detailRef
-      detailRef.current = updatedDetail;
+      // 更新 detailRef，这样其他地方使用 detailRef 时能获取到最新信息
+      if (detailRef.current) {
+        detailRef.current = applyCorrection(detailRef.current, correction);
+      }
 
-      console.log('已应用纠错信息到当前视频详情:', updatedDetail);
+      // 更新 availableSources 中的小雅源信息
+      setAvailableSources(prevSources => applyCorrectionsToSources(prevSources));
+
+      console.log('已应用纠错信息');
     }
   };
 
@@ -4073,7 +4117,7 @@ function PlayPageClient() {
         Artplayer.USE_RAF = true;
 
         // 获取当前集的字幕
-        const currentSubtitles = detail?.subtitles?.[currentEpisodeIndex] || [];
+        const currentSubtitles = detailRef.current?.subtitles?.[currentEpisodeIndex] || [];
         const savedSubtitleSize = typeof window !== 'undefined' ? localStorage.getItem('subtitleSize') || '2em' : '2em';
 
         artPlayerRef.current = new Artplayer({
@@ -5034,7 +5078,7 @@ function PlayPageClient() {
         console.log('[PlayPage] Player ready, triggering sync setup');
 
         // 添加字幕切换功能
-        const currentSubtitles = detail?.subtitles?.[currentEpisodeIndex] || [];
+        const currentSubtitles = detailRef.current?.subtitles?.[currentEpisodeIndex] || [];
         if (currentSubtitles.length > 0 && artPlayerRef.current) {
           const subtitleOptions = [
             {
@@ -5957,7 +6001,7 @@ function PlayPageClient() {
 
     // 调用异步初始化函数
     initPlayer();
-  }, [videoUrl, loading, blockAdEnabled, currentEpisodeIndex, detail?.subtitles]);
+  }, [videoUrl, loading, blockAdEnabled, currentEpisodeIndex]);
 
   // 当组件卸载时清理定时器、Wake Lock 和播放器资源
   useEffect(() => {
@@ -7012,7 +7056,7 @@ function PlayPageClient() {
                 {detail?.type_name && <span>{detail.type_name}</span>}
               </div>
               {/* 剧情简介 */}
-              {(doubanCardSubtitle || detail?.desc) && (
+              {(doubanCardSubtitle || correctedDesc || detail?.desc) && (
                 <div
                   className={`mt-0 text-base leading-relaxed opacity-90 overflow-y-auto pr-2 flex-1 min-h-0 scrollbar-hide ${tmdbBackdrop ? 'text-white' : ''}`}
                   style={{ whiteSpace: 'pre-line' }}
@@ -7023,7 +7067,7 @@ function PlayPageClient() {
                       {doubanCardSubtitle}
                     </div>
                   )}
-                  {detail?.desc}
+                  {correctedDesc || detail?.desc}
                 </div>
               )}
             </div>
@@ -7252,6 +7296,19 @@ const applyCorrection = (detail: SearchResult, correction: any): SearchResult =>
     douban_id: correction.doubanId ? (typeof correction.doubanId === 'string' ? parseInt(correction.doubanId, 10) : correction.doubanId) : detail.douban_id,
     type_name: correction.mediaType === 'movie' ? '电影' : (correction.mediaType === 'tv' ? '电视剧' : detail.type_name),
   };
+};
+
+// 批量应用纠错信息到源列表
+const applyCorrectionsToSources = (sources: SearchResult[]): SearchResult[] => {
+  return sources.map(source => {
+    if (source.source === 'xiaoya') {
+      const correction = getXiaoyaCorrection(source.source, source.id);
+      if (correction) {
+        return applyCorrection(source, correction);
+      }
+    }
+    return source;
+  });
 };
 
 // FavoriteIcon 组件
